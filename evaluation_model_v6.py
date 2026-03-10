@@ -3,6 +3,7 @@ import os
 import csv
 import random
 import re
+from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Sequence, Any
 
 import numpy as np
@@ -54,6 +55,9 @@ ENSEMBLE_MODE = "logit"  # "prob" (확률 평균) or "logit" (로짓 평균)
 # - "single": 각 fold 단일 모델 평가 + fold mean/std 저장
 # - "ensemble": 전체 ensemble 평가만 수행
 EVAL_MODE = "single"  # "single" or "ensemble"
+IS_FOLD = True
+# True:  주어진 가중치를 fold 모델로 취급 → fold mean/std 계산 (EVAL_MODE="single"일 때만 적용)
+# False: 주어진 가중치를 개별 모델로 취급 → 파일명 stem을 모델 태그로 사용
 
 # 4) 결과 저장
 RUN_NAME = "eval_run"
@@ -948,6 +952,35 @@ def _safe_class_name(name: str) -> str:
     return re.sub(r"[^a-zA-Z0-9._-]+", "_", name)
 
 
+def _draw_bottom_text_box(
+    img: Image.Image,
+    info: str,
+    font: Optional[ImageFont.ImageFont],
+) -> Image.Image:
+    """이미지 하단에 어두운 배경의 텍스트 박스를 붙여 반환한다."""
+    lines = info.split("\n")
+    # 라인 높이 추정 (font.size가 없으면 기본값 16 사용)
+    if font is not None and hasattr(font, "size"):
+        line_h = font.size + 4
+    else:
+        line_h = 16
+    padding = 4
+    box_h = line_h * len(lines) + padding * 2
+
+    # 원본 이미지 아래에 텍스트 박스 영역을 합친 새 이미지 생성
+    new_img = Image.new("RGB", (img.width, img.height + box_h), (0, 0, 0))
+    new_img.paste(img, (0, 0))
+
+    draw = ImageDraw.Draw(new_img)
+    draw.rectangle([0, img.height, img.width, img.height + box_h], fill=(20, 20, 20))
+    y = img.height + padding
+    for line in lines:
+        draw.text((padding, y), line, fill=(255, 255, 255), font=font)
+        y += line_h
+
+    return new_img
+
+
 def _save_cam_overlay(
     model: nn.Module,
     dataset: CSVMappedImageDataset,
@@ -1242,7 +1275,7 @@ def _print_final_summary(
     overfit_score_lines: List[str],
     ece_by_tag: Dict[str, float],
     eval_by_tag: Dict[str, Dict[str, float]],
-    n_folds: int,
+    model_tags: List[str],
     eval_mode: str,
 ):
     print("=" * 50)
@@ -1255,6 +1288,8 @@ def _print_final_summary(
     print(f"[EvalMode] {eval_mode}")
     if eval_mode == "ensemble":
         print(f"[Ensemble] mode={ENSEMBLE_MODE}")
+    elif eval_mode == "single" and not IS_FOLD:
+        print("[SingleMode] IS_FOLD=False → filename stem used as model tag")
     print("=" * 30)
 
     for ln in overfit_score_lines:
@@ -1264,8 +1299,7 @@ def _print_final_summary(
     print("=" * 30)
     if ENABLE_CALIBRATION:
         print(f"[overfit:cal] ECE (top-label multiclass, bins={ECE_NUM_BINS})")
-        for i in range(1, n_folds + 1):
-            tag = f"fold{i}"
+        for tag in model_tags:
             if tag in ece_by_tag:
                 print(f"  - {tag}: ECE={ece_by_tag[tag]:.4f}")
         if "ensemble" in ece_by_tag:
@@ -1277,8 +1311,7 @@ def _print_final_summary(
 
     print("=" * 30)
     print("[Eval] acc macro_f1 roc_auc_macro")
-    for i in range(1, n_folds + 1):
-        tag = f"fold{i}"
+    for tag in model_tags:
         if tag in eval_by_tag:
             print(f"[Eval] {tag}: acc={eval_by_tag[tag]['acc']:.4f}  macro_f1={eval_by_tag[tag]['macro_f1']:.4f}  roc_auc_macro={eval_by_tag[tag].get('roc_auc_macro', float('nan')):.4f}")
     if "ensemble" in eval_by_tag:
@@ -1330,14 +1363,16 @@ def run_all_evaluations(ckpt_paths: List[str]):
         saved_logs.append(f"[Info] calibration/reliability uses top-label multiclass confidence (ECE_NUM_BINS={ECE_NUM_BINS})")
     else:
         saved_logs.append("[Info] calibration/reliability skipped by ENABLE_CALIBRATION=False")
+    if EVAL_MODE == "single" and not IS_FOLD:
+        saved_logs.append("[Info] single mode: IS_FOLD=False → filename stem used as model tag")
     if ENABLE_CAM and EVAL_MODE == "ensemble":
         saved_logs.append("[Info] ensemble CAM uses representative fold model (fold1) for visualization")
     elif not ENABLE_CAM:
         saved_logs.append("[Info] CAM generation skipped by ENABLE_CAM=False")
 
     if EVAL_MODE == "single":
-        for i, model in enumerate(fold_models, start=1):
-            tag = f"fold{i}"
+        for i, (model, ckpt_p) in enumerate(zip(fold_models, ckpt_paths), start=1):
+            tag = f"fold{i}" if IS_FOLD else Path(ckpt_p).stem
             fold_dir = os.path.join(out_root, tag)
             os.makedirs(fold_dir, exist_ok=True)
 
@@ -1465,12 +1500,18 @@ def run_all_evaluations(ckpt_paths: List[str]):
                 saved_logs=saved_logs,
             )
 
+    if EVAL_MODE == "single":
+        model_tags = [f"fold{i+1}" for i in range(len(ckpt_paths))] if IS_FOLD \
+                     else [Path(p).stem for p in ckpt_paths]
+    else:  # ensemble
+        model_tags = [f"fold{i+1}" for i in range(len(ckpt_paths))]
+
     _print_final_summary(
         saved_logs=saved_logs,
         overfit_score_lines=overfit_score_lines,
         ece_by_tag=ece_by_tag,
         eval_by_tag=eval_by_tag,
-        n_folds=len(ckpt_paths),
+        model_tags=model_tags,
         eval_mode=EVAL_MODE,
     )
 
