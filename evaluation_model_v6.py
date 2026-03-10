@@ -45,10 +45,9 @@ TEST_LABELS_CSV = os.path.join(TEST_DIR, "test_labels.csv")
 
 # 2) 평가할 모델 경로 (K-fold checkpoints)
 CKPT_PATH = "./20260108_resnet_finetune_min"
-ENSEMBLE_CKPT_PATHS = [
-    os.path.join(CKPT_PATH, f"fold{i}.pth")
-    for i in range(1, 6)
-]
+# ENSEMBLE_CKPT_PATHS: None이면 CKPT_PATH 내 .pth 파일 자동 탐색
+#   직접 지정할 경우: ["./path/to/a.pth", "./path/to/b.pth", ...]
+ENSEMBLE_CKPT_PATHS = None
 ENSEMBLE_MODE = "logit"  # "prob" (확률 평균) or "logit" (로짓 평균)
 
 # 3) 평가 모드
@@ -85,6 +84,22 @@ ALLOWED_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
 def resolve_out_dir() -> str:
     result_dir_name = RESULT_DIR_NAME or f"eval_results_bin{ECE_NUM_BINS}"
     return os.path.join(CKPT_PATH, result_dir_name, RUN_NAME)
+
+
+def _discover_checkpoints(ckpt_dir: str) -> List[str]:
+    """CKPT_PATH 내 .pth 파일을 자동 탐색하여 정렬된 경로 목록 반환.
+
+    정렬 우선순위:
+      1) 파일명에 fold(숫자) 패턴이 있으면 숫자 오름차순
+      2) 없으면 파일명 알파벳 순
+    """
+    pth_files = list(Path(ckpt_dir).glob("*.pth"))
+
+    def _sort_key(p: Path):
+        m = re.search(r"fold(\d+)", p.stem)
+        return (0, int(m.group(1)), p.stem) if m else (1, 0, p.stem)
+
+    return [str(p) for p in sorted(pth_files, key=_sort_key)]
 
 
 
@@ -1454,8 +1469,8 @@ def run_all_evaluations(ckpt_paths: List[str]):
 
         member_dir = os.path.join(ens_dir, "member_folds")
         os.makedirs(member_dir, exist_ok=True)
-        for i, model in enumerate(fold_models, start=1):
-            member_tag = f"fold{i}"
+        for i, (model, ckpt_p) in enumerate(zip(fold_models, ckpt_paths), start=1):
+            member_tag = f"fold{i}" if IS_FOLD else Path(ckpt_p).stem
             member_out_dir = os.path.join(member_dir, member_tag)
             member_eval = evaluate(
                 models=[model],
@@ -1522,12 +1537,23 @@ def main():
     OUT_DIR = resolve_out_dir()
     os.makedirs(OUT_DIR, exist_ok=True)
 
-    missing = [p for p in ENSEMBLE_CKPT_PATHS if not os.path.exists(p)]
-    if missing:
-        print(f"[Error] missing checkpoints: {missing}")
-        return
+    # 체크포인트 경로 결정: 명시적 지정 우선, 없으면 CKPT_PATH 자동 탐색
+    if ENSEMBLE_CKPT_PATHS is not None:
+        ckpt_paths = ENSEMBLE_CKPT_PATHS
+        missing = [p for p in ckpt_paths if not os.path.exists(p)]
+        if missing:
+            print(f"[Error] missing checkpoints: {missing}")
+            return
+    else:
+        ckpt_paths = _discover_checkpoints(CKPT_PATH)
+        if not ckpt_paths:
+            print(f"[Error] No .pth files found in: {CKPT_PATH}")
+            return
+        print(f"[Info] Auto-discovered {len(ckpt_paths)} checkpoint(s) in '{CKPT_PATH}':")
+        for p in ckpt_paths:
+            print(f"  {p}")
 
-    run_all_evaluations(ENSEMBLE_CKPT_PATHS)
+    run_all_evaluations(ckpt_paths)
 
 
 if __name__ == "__main__":
